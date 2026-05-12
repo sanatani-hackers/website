@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VRM Real-Time Motion Tracking</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { 
+            margin: 0; 
+            display: flex; 
+            height: 100vh; 
+            background-color: #121212; 
+            color: #ffffff; 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow: hidden;
+        }
+        /* Left Side: 3D Canvas & Camera */
+        #render-container {
+            flex: 2;
+            position: relative;
+        }
+        canvas { display: block; width: 100%; height: 100%; }
+        /* Webcam Feed */
+        .video-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 240px;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 2px solid #444;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+            z-index: 10;
+        }
+        video {
+            width: 100%;
+            height: auto;
+            transform: scaleX(-1); /* Mirror effect */
+            display: block;
+        }
+        /* Right Side: Code Output */
+        #code-panel {
+            flex: 1;
+            background: #1e1e1e;
+            border-left: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+        }
+        #code-panel-header {
+            padding: 15px 20px;
+            background: #252526;
+            border-bottom: 1px solid #333;
+            font-weight: bold;
+            color: #4EC9B0;
+        }
+        #live-code-output {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 13px;
+            color: #CE9178;
+            white-space: pre-wrap;
+        }
+        .js-keyword { color: #569CD6; }
+        .js-variable { color: #9CDCFE; }
+        .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 20px; z-index: 20;}
+    </style>
+
+    <!-- Import Libraries via CDN -->
+    <!-- Note: Specific versions are used to ensure compatibility between Three.js, VRM, and Kalidokit -->
+    <script src="https://unpkg.com/three@0.133.0/build/three.js"></script>
+    <script src="https://unpkg.com/three@0.133.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://unpkg.com/@pixiv/three-vrm@0.6.7/lib/three-vrm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5.1675204044/pose.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
+</head>
+<body>
+
+    <div id="render-container">
+        <div id="loading" class="loading">Loading VRM & AI Models...</div>
+        <div class="video-container">
+            <video id="video" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <div id="code-panel">
+        <div id="code-panel-header">Live JS Animation Code</div>
+        <div id="live-code-output">// Waiting for camera and tracking...</div>
+    </div>
+
+    <script>
+        // --- 1. Basic Three.js Setup ---
+        const container = document.getElementById('render-container');
+        const codeOutput = document.getElementById('live-code-output');
+        const videoElement = document.getElementById('video');
+        const loadingElement = document.getElementById('loading');
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(30, container.clientWidth / container.clientHeight, 0.1, 1000);
+        camera.position.set(0, 1.4, 3); // Position camera to look at the upper body
+
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        container.appendChild(renderer.domElement);
+
+        // Lights
+        const light = new THREE.DirectionalLight(0xffffff);
+        light.position.set(1, 1, 1).normalize();
+        scene.add(light);
+        scene.add(new THREE.AmbientLight(0x404040, 1.5));
+
+        // --- 2. Load VRM Model ---
+        let currentVrm = null;
+        const loader = new THREE.GLTFLoader();
+        
+        // Replace this URL with your own VRM model link if needed
+        const vrmUrl = 'https://cdn.jsdelivr.net/gh/pixiv/three-vrm@main/packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm';
+
+        loader.load(vrmUrl,
+            (gltf) => {
+                THREE.VRMUtils.removeUnnecessaryJoints(gltf.scene);
+                THREE.VRM.from(gltf).then((vrm) => {
+                    currentVrm = vrm;
+                    currentVrm.scene.rotation.y = Math.PI; // Face the camera
+                    scene.add(vrm.scene);
+                    loadingElement.style.display = 'none';
+                });
+            },
+            (progress) => console.log('Loading model...', 100.0 * (progress.loaded / progress.total), '%'),
+            (error) => console.error(error)
+        );
+
+        // --- 3. Render Loop ---
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            if (currentVrm) {
+                currentVrm.update(clock.getDelta());
+            }
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        });
+
+        // --- 4. Kalidokit & MediaPipe Setup ---
+        
+        // Rig rotations logic (maps Kalidokit output to VRM bones)
+        const rigRotation = (name, rotation, dampener = 1, lerpAmount = 0.3) => {
+            if (!currentVrm) return;
+            const Part = currentVrm.humanoid.getBoneNode(THREE.VRMSchema.HumanoidBoneName[name]);
+            if (!Part) return;
+            
+            // Apply Euler rotation
+            let euler = new THREE.Euler(
+                rotation.x * dampener,
+                rotation.y * dampener,
+                rotation.z * dampener,
+                rotation.rotationOrder || 'XYZ'
+            );
+            let quaternion = new THREE.Quaternion().setFromEuler(euler);
+            Part.quaternion.slerp(quaternion, lerpAmount); // Smooth movement
+        };
+
+        // Function that runs every time the camera detects a pose
+        const onResults = (results) => {
+            if (!currentVrm) return;
+
+            let pose3DLandmarks = results.poseWorldLandmarks;
+            let pose2DLandmarks = results.poseLandmarks;
+
+            if (pose2DLandmarks && pose3DLandmarks) {
+                // Kalidokit calculates the exact angles based on landmarks
+                let riggedPose = Kalidokit.Pose.solve(pose3DLandmarks, pose2DLandmarks, {
+                    runtime: "vrm",
+                    video: videoElement,
+                });
+
+                // Apply the calculated angles to the VRM model
+                rigRotation("Hips", riggedPose.Hips.rotation, 0.7);
+                rigRotation("Chest", riggedPose.Spine, 0.25, 0.3);
+                rigRotation("Spine", riggedPose.Spine, 0.45, 0.3);
+                
+                rigRotation("RightUpperArm", riggedPose.RightUpperArm, 1, 0.3);
+                rigRotation("RightLowerArm", riggedPose.RightLowerArm, 1, 0.3);
+                rigRotation("LeftUpperArm", riggedPose.LeftUpperArm, 1, 0.3);
+                rigRotation("LeftLowerArm", riggedPose.LeftLowerArm, 1, 0.3);
+
+                // --- 5. Generate and Display Live JS Code ---
+                // We generate the exact JS code string that the user can copy
+                let codeString = `// Apply this code in your Three.js loop
+
+<span class="js-keyword">const</span> <span class="js-variable">dampener</span> = 1;
+<span class="js-keyword">const</span> <span class="js-variable">lerpAmount</span> = 0.3;
+
+<span class="js-keyword">function</span> <span class="js-variable">applyTrackingAnimation</span>(vrm) {
+    <span class="js-keyword">const</span> setRotation = (boneName, rx, ry, rz) => {
+        <span class="js-keyword">const</span> bone = vrm.humanoid.getBoneNode(THREE.VRMSchema.HumanoidBoneName[boneName]);
+        <span class="js-keyword">if</span> (bone) {
+            <span class="js-keyword">const</span> targetQuat = <span class="js-keyword">new</span> THREE.Quaternion().setFromEuler(<span class="js-keyword">new</span> THREE.Euler(rx, ry, rz));
+            bone.quaternion.slerp(targetQuat, lerpAmount);
+        }
+    };
+
+    // Current Live Joint Rotations
+    setRotation("RightUpperArm", ${riggedPose.RightUpperArm.x.toFixed(3)}, ${riggedPose.RightUpperArm.y.toFixed(3)}, ${riggedPose.RightUpperArm.z.toFixed(3)});
+    setRotation("RightLowerArm", ${riggedPose.RightLowerArm.x.toFixed(3)}, ${riggedPose.RightLowerArm.y.toFixed(3)}, ${riggedPose.RightLowerArm.z.toFixed(3)});
+    
+    setRotation("LeftUpperArm", ${riggedPose.LeftUpperArm.x.toFixed(3)}, ${riggedPose.LeftUpperArm.y.toFixed(3)}, ${riggedPose.LeftUpperArm.z.toFixed(3)});
+    setRotation("LeftLowerArm", ${riggedPose.LeftLowerArm.x.toFixed(3)}, ${riggedPose.LeftLowerArm.y.toFixed(3)}, ${riggedPose.LeftLowerArm.z.toFixed(3)});
+    
+    setRotation("Spine", ${riggedPose.Spine.x.toFixed(3)}, ${riggedPose.Spine.y.toFixed(3)}, ${riggedPose.Spine.z.toFixed(3)});
+}`;
+                codeOutput.innerHTML = codeString;
+            }
+        };
+
+        // Initialize MediaPipe Pose AI
+        const pose = new Pose({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+        });
+
+        pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        pose.onResults(onResults);
+
+        // Start Camera
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await pose.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+        cameraUtils.start();
+    </script>
+</body>
+</html>
